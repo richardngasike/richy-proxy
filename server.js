@@ -2,6 +2,8 @@ const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const dotenv = require('dotenv');
 const basicAuth = require('express-basic-auth');
+const http = require('http');
+const net = require('net');
 
 // Load environment variables
 dotenv.config();
@@ -30,54 +32,96 @@ if (process.env.PROXY_USERNAME && process.env.PROXY_PASSWORD) {
 
 // Root route for debugging
 app.get('/', (req, res) => {
-  res.send('Proxy server is running. Kudos richyICT. Use /health to check status or /proxy to route through the proxy.');
+  res.send('Proxy server is running. Kudos richyICT. Use /health to check status.');
 });
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.status(200).send('Proxy server is healthy, kudos wizartech');
+  res.status(200).send('Proxy server is healthy');
 });
 
-// Validate TARGET_URL
-const targetUrl = process.env.TARGET_URL || 'https://www.google.com';
-try {
-  new URL(targetUrl);
-} catch (err) {
-  console.error('Invalid TARGET_URL:', targetUrl);
-  process.exit(1);
-}
-
-// Proxy configuration
+// Proxy configuration for HTTP requests
 const proxyOptions = {
-  target: targetUrl,
+  target: 'http://', // We'll dynamically set the target based on the request
   changeOrigin: true,
   logLevel: 'debug',
-  pathRewrite: { '^/proxy': '' },
   onError: (err, req, res) => {
     console.error('Proxy error:', err);
     res.status(500).send(`Proxy error: ${err.message}`);
   },
   onProxyReq: (proxyReq, req, res) => {
-    if (req.method === 'CONNECT') {
-      res.writeHead(200, { 'Connection': 'keep-alive' });
-      res.end();
-    }
+    console.log(`Forwarding request: ${req.method} ${req.url}`);
   },
   onProxyRes: (proxyRes, req, res) => {
     console.log(`Proxy response: ${req.method} ${req.url} -> ${proxyRes.statusCode}`);
   },
 };
 
-// Apply proxy middleware to /proxy route
-app.use('/proxy', createProxyMiddleware(proxyOptions));
+// Handle all requests (except /health and /) as proxy requests
+app.use((req, res, next) => {
+  // Skip /health and / routes
+  if (req.path === '/' || req.path === '/health') {
+    return next();
+  }
 
-// Error handling for unmatched routes
-app.use((req, res) => {
-  res.status(404).send('Not Found: Use /proxy to route through the proxy, or /health to check status.');
+  // Extract the target URL from the request
+  let targetUrl;
+  if (req.headers.host && req.url) {
+    // When FoxyProxy sends a request, the URL might be absolute (e.g., https://www.hulu.com/)
+    // We need to extract the target from the request
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    targetUrl = url.origin; // e.g., https://www.hulu.com
+  } else {
+    // Fallback to a default target if TARGET_URL is set
+    targetUrl = process.env.TARGET_URL || 'https://www.google.com';
+  }
+
+  try {
+    new URL(targetUrl);
+  } catch (err) {
+    console.error('Invalid target URL:', targetUrl);
+    return res.status(400).send('Invalid target URL');
+  }
+
+  // Update proxy options with the dynamic target
+  proxyOptions.target = targetUrl;
+
+  // Apply the proxy middleware for this request
+  createProxyMiddleware(proxyOptions)(req, res, next);
+});
+
+// Handle CONNECT method for HTTPS tunneling
+app.use((req, res, next) => {
+  if (req.method === 'CONNECT') {
+    const [host, port] = req.url.split(':');
+    const targetPort = port || 443;
+
+    // Create a socket connection to the target
+    const socket = net.connect(targetPort, host, () => {
+      res.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      socket.pipe(res);
+      res.pipe(socket);
+    });
+
+    socket.on('error', (err) => {
+      console.error('Socket error:', err);
+      res.status(500).send(`Socket error: ${err.message}`);
+    });
+
+    return;
+  }
+  next();
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = http.createServer(app);
+server.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
+});
+
+// Handle server errors
+server.on('error', (err) => {
+  console.error('Server error:', err);
+  process.exit(1);
 });
